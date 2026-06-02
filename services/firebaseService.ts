@@ -1,5 +1,5 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, doc, onSnapshot, updateDoc, setDoc, collection, writeBatch, enableIndexedDbPersistence } from 'firebase/firestore';
+import { getFirestore, doc, onSnapshot, updateDoc, setDoc, collection, writeBatch, enableIndexedDbPersistence, deleteDoc } from 'firebase/firestore';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { FirebaseConfig, DashboardCardData, ClassDataMap, TournamentState, ActivityLogData, GalleryData } from '../types';
 import firebaseAppletConfig from '../firebase-applet-config.json';
@@ -45,6 +45,12 @@ let db: any = null;
 let app: any = null;
 let auth: any = null;
 let persistenceEnabled = false;
+
+const cleanData = (obj: any): any => {
+  return JSON.parse(JSON.stringify(obj, (key, value) => {
+    return value === undefined ? null : value;
+  }));
+};
 
 export const initFirebase = () => {
   if (db && auth) return true;
@@ -196,7 +202,7 @@ export const subscribeToActivityLog = (callback: (data: ActivityLogData | null) 
 
 export const saveActivityLogToFirestore = async (data: ActivityLogData) => {
   if (!db) return;
-  await setDoc(doc(db, 'activities', 'log'), data);
+  await setDoc(doc(db, 'activities', 'log'), cleanData(data));
 };
 
 // --- REAL-TIME TOURNAMENT SYNC ---
@@ -214,7 +220,38 @@ export const subscribeToTournament = (callback: (data: TournamentState | null) =
 
 export const saveTournamentToFirestore = async (data: TournamentState) => {
   if (!db) return;
-  await setDoc(doc(db, 'tournaments', 'active'), data);
+  await setDoc(doc(db, 'tournaments', 'active'), cleanData(data));
+};
+
+export const subscribeToSavedTournaments = (callback: (data: TournamentState[]) => void) => {
+  if (!db) {
+    callback([]);
+    return () => {};
+  }
+  return onSnapshot(collection(db, 'tournaments'), (snapshot: any) => {
+    const list: TournamentState[] = [];
+    snapshot.forEach((doc: any) => {
+      if (doc.id !== 'active') {
+        list.push({ id: doc.id, ...doc.data() } as TournamentState);
+      }
+    });
+    list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    callback(list);
+  });
+};
+
+export const saveTournamentToHistory = async (id: string, data: TournamentState) => {
+  if (!db) return;
+  await setDoc(doc(db, 'tournaments', id), cleanData({
+    ...data,
+    id,
+    createdAt: data.createdAt || Date.now()
+  }));
+};
+
+export const deleteSavedTournament = async (id: string) => {
+  if (!db) return;
+  await deleteDoc(doc(db, 'tournaments', id));
 };
 
 // --- REAL-TIME GALLERY SYNC ---
@@ -232,5 +269,5 @@ export const subscribeToGallery = (callback: (data: GalleryData | null) => void)
 
 export const saveGalleryToFirestore = async (data: GalleryData) => {
   if (!db) return;
-  await setDoc(doc(db, 'gallery', 'main'), data);
+  await setDoc(doc(db, 'gallery', 'main'), cleanData(data));
 };

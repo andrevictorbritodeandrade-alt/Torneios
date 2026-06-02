@@ -1,6 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Player, Match, Group, TournamentState, KnockoutMatch, KnockoutRound } from '../types';
-import { subscribeToTournament, saveTournamentToFirestore } from '../services/firebaseService';
+import { 
+  subscribeToTournament, 
+  saveTournamentToFirestore,
+  subscribeToSavedTournaments,
+  saveTournamentToHistory,
+  deleteSavedTournament 
+} from '../services/firebaseService';
 
 // --- LOGIC HELPERS ---
 
@@ -12,6 +18,77 @@ const shuffleArray = (array: any[]) => {
     [array[i], array[j]] = [array[j], array[i]];
   }
   return array;
+};
+
+const generateInterclassesGroups = (players: Player[], numGroups: number): Group[] | null => {
+  const pool = [...players];
+  
+  for (let attempt = 0; attempt < 5000; attempt++) {
+    // Shuffle the copy of players
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+
+    const groups: Group[] = Array.from({ length: numGroups }, (_, i) => ({
+      id: i,
+      name: `Grupo ${String.fromCharCode(65 + i)}`,
+      players: []
+    }));
+
+    let success = true;
+    
+    const byClass: Record<string, Player[]> = {};
+    pool.forEach(p => {
+      const key = (p.class || 'Geral').trim().toUpperCase();
+      if (!byClass[key]) byClass[key] = [];
+      byClass[key].push(p);
+    });
+
+    const classKeys = Object.keys(byClass).sort((a, b) => byClass[b].length - byClass[a].length);
+    
+    for (const cKey of classKeys) {
+      const classPlayers = [...byClass[cKey]];
+      for (let i = classPlayers.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [classPlayers[i], classPlayers[j]] = [classPlayers[j], classPlayers[i]];
+      }
+
+      for (const player of classPlayers) {
+        const maxGroupSize = Math.ceil(players.length / numGroups);
+        const eligibleGroup = groups.find(g => {
+          if (g.players.length >= maxGroupSize) return false;
+          const hasSameClass = g.players.some(pId => {
+            const existingPlayer = players.find(p => p.id === pId);
+            return existingPlayer && (existingPlayer.class || 'Geral').trim().toUpperCase() === cKey;
+          });
+          return !hasSameClass;
+        });
+
+        if (eligibleGroup) {
+          eligibleGroup.players.push(player.id);
+        } else {
+          const backupGroup = groups.find(g => g.players.length < maxGroupSize);
+          if (backupGroup) {
+            backupGroup.players.push(player.id);
+          } else {
+            success = false;
+            break;
+          }
+        }
+      }
+      if (!success) break;
+    }
+
+    if (success) {
+      const isPerfect = groups.every(g => g.players.length === Math.ceil(players.length / numGroups));
+      if (isPerfect) {
+        return groups;
+      }
+    }
+  }
+
+  return null;
 };
 
 const DEFAULT_RULES = [
@@ -302,10 +379,78 @@ const buildKnockoutStructure = (bracketPlayers: Player[]): KnockoutRound[] => {
   return rounds;
 };
 
+// --- DYNAMIC SUMMARY HELPERS ---
+
+export const getTournamentSummary = (t: TournamentState): string => {
+  const modalityMap: Record<string, string> = {
+    xadrez_dama: 'Xadrez / Dama ♟️',
+    futebol_futsal: 'Futebol / Futsal ⚽',
+    basquete: 'Basquete 🏀',
+    handebol: 'Handebol 🤾',
+    volei: 'Vôlei 🏐',
+    queimado: 'Queimado ☄️',
+    tenis_mesa: 'Tênis de Mesa 🏓',
+    outro: 'Outro Esporte 🥇'
+  };
+
+  const formatMap: Record<string, string> = {
+    mata_mata: 'Mata-Mata Direto ⚔️',
+    grupos_mata_mata: 'Fase de Grupos + Playoffs 🌍',
+    grupo_unico: 'Campeonato de Pontos Corridos 📊'
+  };
+
+  const stageMap: Record<string, string> = {
+    setup: 'Ainda em Configuração ⚙️',
+    groups: 'Em Andamento (Fase de Grupos) 🛡️',
+    finals: 'Em Andamento (Playoffs / Chaveamento) ⚔️',
+    finished: 'Finalizado 🏆'
+  };
+
+  const modName = t.modality ? modalityMap[t.modality] || t.modality : 'Xadrez / Dama ♟️';
+  const formatName = t.format ? formatMap[t.format] || t.format : 'Fase de Grupos + Playoffs';
+  const stageName = t.stage ? stageMap[t.stage] || t.stage : 'Ainda em Configuração';
+  const typeText = t.participantType === 'team' ? 'Equipes' : 'Competidores';
+  const playerCount = t.players?.length || 0;
+
+  let summary = `Competição de ${modName} no formato de ${formatName} em categoria ${t.participantType === 'team' ? 'por Equipes' : 'Individual'}. `;
+  summary += `Reúne ${playerCount} ${typeText.toLowerCase()} e atualmente seu status é: ${stageName}.`;
+
+  if (t.stage === 'groups' && t.groups?.length > 0) {
+    summary += ` O torneio está dividido em ${t.groups.length} grupos e possui confrontos em andamento.`;
+  } else if (t.stage === 'finals') {
+    summary += ` A fase decisiva de Playoffs está ativa no formato ${t.finalsFormat === 'copa_do_mundo' ? 'Copa do Mundo (Chaveamento)' : 'Tradicional'}.`;
+  } else if (t.stage === 'finished') {
+    summary += ` O torneio foi concluído após disputas acirradas.`;
+  }
+
+  return summary;
+};
+
+export const generateAISummary = async (t: TournamentState): Promise<string> => {
+  try {
+    const res = await fetch("/api/generate-summary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tournamentData: t })
+    });
+    const data = await res.json();
+    if (data.summary) return data.summary;
+  } catch (error) {
+    console.error("Erro ao chamar proxy do Gemini:", error);
+  }
+  return getTournamentSummary(t);
+};
+
 // --- COMPONENT ---
 
 export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) => {
   
+  // Navigation View State
+  const [currentView, setCurrentView] = useState<'portal' | 'tournament'>('portal');
+  const [savedTournaments, setSavedTournaments] = useState<TournamentState[]>([]);
+  const [tournamentName, setTournamentName] = useState('Torneio do Cordélia Paiva');
+  const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
+
   // Setup Wizard State
   const [setupStep, setSetupStep] = useState<0 | 1 | 2 | 3>(0); // 0: Modality & Team type, 1: Count, 2: Format option, 3: Names
   const [modality, setModality] = useState<'xadrez_dama' | 'futebol_futsal' | 'basquete' | 'handebol' | 'volei' | 'queimado' | 'tenis_mesa' | 'outro'>('xadrez_dama');
@@ -336,6 +481,7 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
   const [showRulesModal, setShowRulesModal] = useState(false);
   const [isEditingRules, setIsEditingRules] = useState(false);
   const [rulesDraft, setRulesDraft] = useState('');
+  const [isInterclassesSorteio, setIsInterclassesSorteio] = useState(false);
 
   const isRemoteUpdate = useRef(false);
 
@@ -345,7 +491,17 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
       if (data) {
         isRemoteUpdate.current = true;
         setTData(data);
+        if (data.stage !== 'setup') {
+          setCurrentView('tournament');
+        }
       }
+    });
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    const unsub = subscribeToSavedTournaments((list) => {
+      setSavedTournaments(list);
     });
     return () => unsub();
   }, []);
@@ -358,6 +514,9 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
     // Simple debounce to save state
     const timer = setTimeout(() => {
       saveTournamentToFirestore(tData);
+      if (tData.id && tData.stage !== 'setup') {
+        saveTournamentToHistory(tData.id, tData);
+      }
     }, 500);
     return () => clearTimeout(timer);
   }, [tData]);
@@ -507,13 +666,22 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
       [shuffledList[i], shuffledList[j]] = [shuffledList[j], shuffledList[i]];
     }
 
+    const classesPreset = ["Turma A", "Turma B", "Turma C", "Turma D", "Turma E", "Turma F"];
+
     const newInputs = Array.from({ length: playerCount }, (_, i) => {
       const name = i < shuffledList.length ? shuffledList[i] : `${participantType === 'team' ? 'Equipe' : 'Jogador'} ${i + 1}`;
-      const classes = ["6º Ano A", "7º Ano B", "8º Ano A", "9º Ano C", "Clube Geral"];
-      const randomClass = classes[Math.floor(Math.random() * classes.length)];
+      let assignedClass = "";
+      if (isInterclassesSorteio && playerCount === 24) {
+        // Distribute 4 players to each of the 6 classes
+        assignedClass = classesPreset[Math.floor(i / 4)];
+      } else {
+        const classes = ["6º Ano A", "7º Ano B", "8º Ano A", "9º Ano C", "Clube Geral"];
+        assignedClass = classes[Math.floor(Math.random() * classes.length)];
+      }
+
       return {
         name,
-        class: randomClass
+        class: assignedClass
       };
     });
     setPlayerInputs(newInputs);
@@ -525,129 +693,183 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
     setPlayerInputs(newInputs);
   };
 
-  const startTournament = () => {
+  const startTournament = async () => {
     const validInputs = playerInputs.filter(p => p.name.trim() !== '');
     if (validInputs.length !== playerCount) {
       alert(`Por favor, preencha o nome de todos os ${playerCount} participantes.`);
       return;
     }
 
-    const pNameType = participantType === 'team' ? 'Equipe' : 'Jogador';
+    setIsGeneratingSummary(true);
 
-    const players: Player[] = validInputs.map(p => ({
-      id: generateUUID(),
-      name: p.name.trim(),
-      class: p.class.trim() || 'Geral',
-      points: 0, wins: 0, draws: 0, losses: 0, gamesPlayed: 0,
-      goalsFor: 0, goalsAgainst: 0
-    }));
-
-    const shuffledPlayers = shuffleArray([...players]);
-
-    if (selectedFormat === 'mata_mata') {
-      const knockoutRounds = buildKnockoutStructure(shuffledPlayers);
-      if (knockoutRounds.length === 0) return;
+    try {
+      const players: Player[] = validInputs.map(p => ({
+        id: generateUUID(),
+        name: p.name.trim(),
+        class: p.class.trim() || 'Geral',
+        points: 0, wins: 0, draws: 0, losses: 0, gamesPlayed: 0,
+        goalsFor: 0, goalsAgainst: 0
+      }));
+  
+      const shuffledPlayers = shuffleArray([...players]);
+      const id = `saved_${generateUUID()}`;
+      const name = tournamentName.trim() || 'Torneio Interescolar';
+  
+      let newTState: TournamentState;
+  
+      if (selectedFormat === 'mata_mata') {
+        const knockoutRounds = buildKnockoutStructure(shuffledPlayers);
+        if (knockoutRounds.length === 0) {
+          return;
+        }
+        
+        newTState = {
+          id,
+          name,
+          createdAt: Date.now(),
+          stage: 'finals',
+          players: shuffledPlayers,
+          groups: [],
+          matches: [],
+          finalMatches: [],
+          finalPlayers: shuffledPlayers.map(p => p.id),
+          modality,
+          participantType,
+          format: 'mata_mata',
+          knockoutRounds,
+          currentKnockoutRoundIndex: 0,
+          rules: RULES_PRESETS[modality] || RULES_PRESETS.outro
+        };
+      } else if (selectedFormat === 'grupo_unico') {
+        const groups: Group[] = [{
+          id: 0,
+          name: 'Grupo Único',
+          players: shuffledPlayers.map(p => p.id)
+        }];
+  
+        const matches: Match[] = [];
+        const pIds = groups[0].players;
+        for (let i = 0; i < pIds.length; i++) {
+          for (let j = i + 1; j < pIds.length; j++) {
+            matches.push({
+              id: generateUUID(),
+              p1Id: pIds[i],
+              p2Id: pIds[j],
+              result: null,
+              p1Score: undefined,
+              p2Score: undefined,
+              groupIndex: 0
+            });
+          }
+        }
+  
+        newTState = {
+          id,
+          name,
+          createdAt: Date.now(),
+          stage: 'groups',
+          players: shuffledPlayers,
+          groups,
+          matches,
+          finalMatches: [],
+          finalPlayers: [],
+          modality,
+          participantType,
+          format: 'grupo_unico',
+          rules: RULES_PRESETS[modality] || RULES_PRESETS.outro
+        };
+      } else {
+        // --- COPA DO MUNDO STYLE PREPARATIONS ---
+        let groups: Group[];
+        if (isInterclassesSorteio) {
+          const customGroups = generateInterclassesGroups(shuffledPlayers, selectedNumGroups);
+          if (customGroups) {
+            groups = customGroups;
+          } else {
+            // Fallback to standard
+            groups = Array.from({ length: selectedNumGroups }, (_, i) => ({
+              id: i,
+              name: `Grupo ${String.fromCharCode(65 + i)}`,
+              players: []
+            }));
+            shuffledPlayers.forEach((p, idx) => {
+              const groupIdx = idx % selectedNumGroups;
+              groups[groupIdx].players.push(p.id);
+            });
+          }
+        } else {
+          groups = Array.from({ length: selectedNumGroups }, (_, i) => ({
+            id: i,
+            name: `Grupo ${String.fromCharCode(65 + i)}`,
+            players: []
+          }));
+          shuffledPlayers.forEach((p, idx) => {
+            const groupIdx = idx % selectedNumGroups;
+            groups[groupIdx].players.push(p.id);
+          });
+        }
+  
+        const matches: Match[] = [];
+        groups.forEach(group => {
+          const pIds = group.players;
+          for (let i = 0; i < pIds.length; i++) {
+            for (let j = i + 1; j < pIds.length; j++) {
+              matches.push({
+                id: generateUUID(),
+                p1Id: pIds[i],
+                p2Id: pIds[j],
+                result: null,
+                p1Score: undefined,
+                p2Score: undefined,
+                groupIndex: group.id
+              });
+            }
+          }
+        });
+  
+        newTState = {
+          id,
+          name,
+          createdAt: Date.now(),
+          stage: 'groups',
+          players: shuffledPlayers,
+          groups,
+          matches,
+          finalMatches: [],
+          finalPlayers: [],
+          modality,
+          participantType,
+          format: 'grupos_mata_mata',
+          numAdvancersPerGroup: numAdvancers,
+          finalsFormat: finalsStyle,
+          isInterclassesSorteio: isInterclassesSorteio,
+          rules: RULES_PRESETS[modality] || RULES_PRESETS.outro
+        };
+      }
+  
+      try {
+        const summaryText = await generateAISummary(newTState);
+        newTState.summary = summaryText;
+      } catch (e) {
+        console.error("Erro ao gerar resumo IA, usando fallback", e);
+        newTState.summary = getTournamentSummary(newTState);
+      }
+  
+      await saveTournamentToHistory(id, newTState);
+      await saveTournamentToFirestore(newTState);
+  
+      setTData(newTState);
+      setCurrentView('tournament');
       
-      setTData({
-        stage: 'finals',
-        players: shuffledPlayers,
-        groups: [],
-        matches: [],
-        finalMatches: [],
-        finalPlayers: shuffledPlayers.map(p => p.id),
-        modality,
-        participantType,
-        format: 'mata_mata',
-        knockoutRounds,
-        currentKnockoutRoundIndex: 0,
-        rules: RULES_PRESETS[modality] || RULES_PRESETS.outro
-      });
-      setActiveRoundIndex(0);
-      return;
-    }
-
-    if (selectedFormat === 'grupo_unico') {
-      const groups: Group[] = [{
-        id: 0,
-        name: 'Grupo Único',
-        players: shuffledPlayers.map(p => p.id)
-      }];
-
-      const matches: Match[] = [];
-      const pIds = groups[0].players;
-      for (let i = 0; i < pIds.length; i++) {
-        for (let j = i + 1; j < pIds.length; j++) {
-          matches.push({
-            id: generateUUID(),
-            p1Id: pIds[i],
-            p2Id: pIds[j],
-            result: null,
-            p1Score: undefined,
-            p2Score: undefined,
-            groupIndex: 0
-          });
-        }
+      if (selectedFormat === 'mata_mata') {
+        setActiveRoundIndex(0);
       }
-
-      setTData({
-        stage: 'groups',
-        players: shuffledPlayers,
-        groups,
-        matches,
-        finalMatches: [],
-        finalPlayers: [],
-        modality,
-        participantType,
-        format: 'grupo_unico',
-        rules: RULES_PRESETS[modality] || RULES_PRESETS.outro
-      });
-      return;
+    } catch (e) {
+      console.error("Erro fatal ao iniciar torneio:", e);
+      alert("Ocorreu um erro ao gerar o torneio. Tente novamente.");
+    } finally {
+      setIsGeneratingSummary(false);
     }
-
-    // --- COPA DO MUNDO STYLE PREPARATIONS ---
-    const groups: Group[] = Array.from({ length: selectedNumGroups }, (_, i) => ({
-      id: i,
-      name: `Grupo ${String.fromCharCode(65 + i)}`,
-      players: []
-    }));
-
-    shuffledPlayers.forEach((p, idx) => {
-      const groupIdx = idx % selectedNumGroups;
-      groups[groupIdx].players.push(p.id);
-    });
-
-    const matches: Match[] = [];
-    groups.forEach(group => {
-      const pIds = group.players;
-      for (let i = 0; i < pIds.length; i++) {
-        for (let j = i + 1; j < pIds.length; j++) {
-          matches.push({
-            id: generateUUID(),
-            p1Id: pIds[i],
-            p2Id: pIds[j],
-            result: null,
-            p1Score: undefined,
-            p2Score: undefined,
-            groupIndex: group.id
-          });
-        }
-      }
-    });
-
-    setTData({
-      stage: 'groups',
-      players: shuffledPlayers,
-      groups,
-      matches,
-      finalMatches: [],
-      finalPlayers: [],
-      modality,
-      participantType,
-      format: 'grupos_mata_mata',
-      numAdvancersPerGroup: numAdvancers,
-      finalsFormat: finalsStyle,
-      rules: RULES_PRESETS[modality] || RULES_PRESETS.outro
-    });
   };
 
   // --- GAMEPLAY ACTIONS ---
@@ -953,6 +1175,150 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
 
   const advanceToFinals = () => {
     if (tData.format === 'grupos_mata_mata' && tData.finalsFormat === 'copa_do_mundo') {
+      // Copa do Mundo style 24 players (6 groups of 4)
+      if (tData.groups.length === 6) {
+        const firstAndSecondPlaces: { player: Player; groupIdx: number; rank: number }[] = [];
+        const thirdPlaces: { player: Player; groupIdx: number; rank: number }[] = [];
+
+        tData.groups.forEach((g, gIdx) => {
+          const sorted = getGroupStandings(g.id, g.players);
+          if (sorted.length >= 1) {
+            firstAndSecondPlaces.push({ player: sorted[0], groupIdx: gIdx, rank: 1 });
+          }
+          if (sorted.length >= 2) {
+            firstAndSecondPlaces.push({ player: sorted[1], groupIdx: gIdx, rank: 2 });
+          }
+          if (sorted.length >= 3) {
+            thirdPlaces.push({ player: sorted[2], groupIdx: gIdx, rank: 3 });
+          }
+        });
+
+        // Sort the third places by points, goal difference (if sport), etc.
+        const isSport = tData.modality && tData.modality !== 'xadrez_dama' && tData.modality !== 'outro';
+        thirdPlaces.sort((a, b) => {
+          const pa = a.player as any;
+          const pb = b.player as any;
+          if (pb.points !== pa.points) return pb.points - pa.points;
+          if (isSport) {
+            const sgB = pb.goalsFor - pb.goalsAgainst;
+            const sgA = pa.goalsFor - pa.goalsAgainst;
+            if (sgB !== sgA) return sgB - sgA;
+            if (pb.goalsFor !== pa.goalsFor) return pb.goalsFor - pa.goalsFor;
+          }
+          if (pb.wins !== pa.wins) return pb.wins - pa.wins;
+          return 0;
+        });
+
+        const bestFourThirdPlaces = thirdPlaces.slice(0, 4);
+        
+        // Group winners, runners-up, and top third-places
+        const firstA = firstAndSecondPlaces.find(q => q.groupIdx === 0 && q.rank === 1)?.player;
+        const firstB = firstAndSecondPlaces.find(q => q.groupIdx === 1 && q.rank === 1)?.player;
+        const firstC = firstAndSecondPlaces.find(q => q.groupIdx === 2 && q.rank === 1)?.player;
+        const firstD = firstAndSecondPlaces.find(q => q.groupIdx === 3 && q.rank === 1)?.player;
+        const firstE = firstAndSecondPlaces.find(q => q.groupIdx === 4 && q.rank === 1)?.player;
+        const firstF = firstAndSecondPlaces.find(q => q.groupIdx === 5 && q.rank === 1)?.player;
+
+        const secondA = firstAndSecondPlaces.find(q => q.groupIdx === 0 && q.rank === 2)?.player;
+        const secondB = firstAndSecondPlaces.find(q => q.groupIdx === 1 && q.rank === 2)?.player;
+        const secondC = firstAndSecondPlaces.find(q => q.groupIdx === 2 && q.rank === 2)?.player;
+        const secondD = firstAndSecondPlaces.find(q => q.groupIdx === 3 && q.rank === 2)?.player;
+        const secondE = firstAndSecondPlaces.find(q => q.groupIdx === 4 && q.rank === 2)?.player;
+        const secondF = firstAndSecondPlaces.find(q => q.groupIdx === 5 && q.rank === 2)?.player;
+
+        // Assign top third-placed opponents to winners of A, B, E, F avoiding immediate group repeats if possible
+        const thirdsPool = [...bestFourThirdPlaces];
+        const getOpponentForHeader = (headerGroupIdx: number): Player => {
+          const matchedIdx = thirdsPool.findIndex(t => t.groupIdx !== headerGroupIdx);
+          if (matchedIdx !== -1) {
+            const matched = thirdsPool[matchedIdx].player;
+            thirdsPool.splice(matchedIdx, 1);
+            return matched;
+          }
+          const matched = thirdsPool[0]?.player || firstAndSecondPlaces[0].player;
+          if (thirdsPool.length > 0) thirdsPool.splice(0, 1);
+          return matched;
+        };
+
+        const oppForA = getOpponentForHeader(0);
+        const oppForB = getOpponentForHeader(1);
+        const oppForE = getOpponentForHeader(4);
+        const oppForF = getOpponentForHeader(5);
+
+        // Map pairings in standard Copa do Mundo order (giving Round of 16 bracket)
+        const matchUps = [
+          { p1: firstA, p2: oppForA },
+          { p1: secondA, p2: secondC },
+          { p1: firstD, p2: oppForB },
+          { p1: secondB, p2: secondD },
+          { p1: firstC, p2: oppForE },
+          { p1: secondE, p2: secondF },
+          { p1: firstE, p2: oppForF },
+          { p1: firstF, p2: secondA || secondB } // fallback/last second place
+        ];
+
+        // Sanitize
+        const finalMatchesWithOpponents = matchUps.filter(m => m.p1 && m.p2);
+        const bracketPlayers = finalMatchesWithOpponents.reduce((acc: Player[], m) => {
+          acc.push(m.p1, m.p2);
+          return acc;
+        }, []);
+
+        const firstRoundKnockoutMatches: KnockoutMatch[] = finalMatchesWithOpponents.map((m, idx) => ({
+          id: generateUUID(),
+          p1Id: m.p1.id,
+          p2Id: m.p2.id,
+          roundIndex: 0,
+          matchIndex: idx
+        }));
+
+        const rounds: KnockoutRound[] = [];
+        rounds.push({
+          name: "Oitavas de Final",
+          matches: firstRoundKnockoutMatches
+        });
+
+        let prevMatches = firstRoundKnockoutMatches;
+        let roundIdx = 1;
+        let nextMatchesCount = 4;
+        while (nextMatchesCount >= 1) {
+          const roundMatches: KnockoutMatch[] = [];
+          for (let m = 0; m < nextMatchesCount; m++) {
+            const parent1 = prevMatches[2 * m];
+            const parent2 = prevMatches[2 * m + 1];
+            roundMatches.push({
+              id: generateUUID(),
+              p1Id: null,
+              p2Id: null,
+              roundIndex: roundIdx,
+              matchIndex: m,
+              p1SourceMatchId: parent1.id,
+              p2SourceMatchId: parent2.id,
+              p1Score: undefined,
+              p2Score: undefined,
+              result: null,
+              winnerId: null
+            } as any);
+          }
+          rounds.push({
+            name: nextMatchesCount === 4 ? "Quartas de Final" : nextMatchesCount === 2 ? "Semifinal" : "Grande Final",
+            matches: roundMatches
+          });
+          prevMatches = roundMatches;
+          roundIdx++;
+          nextMatchesCount = Math.floor(nextMatchesCount / 2);
+        }
+
+        setTData(prev => ({
+          ...prev,
+          stage: 'finals',
+          knockoutRounds: rounds,
+          finalPlayers: bracketPlayers.map(p => p.id)
+        }));
+        setActiveRoundIndex(0);
+        return;
+      }
+
       const qualifiers: { playerId: string; rank: number; groupIdx: number }[] = [];
       
       tData.groups.forEach((g, gIdx) => {
@@ -1262,7 +1628,397 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
     );
   };
 
+  const handleLoadTournament = async (selected: TournamentState) => {
+    if (confirm(`Deseja carregar o torneio "${selected.name || 'Torneio'}"? Ele se tornará o torneio ativo atual.`)) {
+      setTData(selected);
+      setTournamentName(selected.name || 'Torneio');
+      setModality(selected.modality || 'xadrez_dama');
+      setParticipantType(selected.participantType || 'individual');
+      setPlayerCount(selected.players?.length || 8);
+      setSelectedFormat(selected.format || 'grupos_mata_mata');
+      await saveTournamentToFirestore(selected);
+      setCurrentView('tournament');
+    }
+  };
+
+  const handleUseFormat = (historicalTournament: TournamentState) => {
+    setModality(historicalTournament.modality || 'xadrez_dama');
+    setParticipantType(historicalTournament.participantType || 'individual');
+    setPlayerCount(historicalTournament.players?.length || 8);
+    setSelectedFormat(historicalTournament.format || 'grupos_mata_mata');
+    if (historicalTournament.groups?.length) {
+      setSelectedNumGroups(historicalTournament.groups.length);
+    }
+    if (historicalTournament.numAdvancersPerGroup) {
+      setNumAdvancers(historicalTournament.numAdvancersPerGroup as any);
+    }
+    if (historicalTournament.finalsFormat) {
+      setFinalsStyle(historicalTournament.finalsFormat as any);
+    }
+    setTournamentName(historicalTournament.name || 'Torneio do Cordélia Paiva');
+    
+    const count = historicalTournament.players?.length || 8;
+    setPlayerInputs(historicalTournament.players?.map(() => ({ name: '', class: '' })) || Array.from({ length: count }, () => ({ name: '', class: '' })));
+    setTData(prev => ({ ...prev, stage: 'setup' }));
+    setSetupStep(3);
+    setCurrentView('tournament');
+  };
+
+  const renderPortalView = () => {
+    const hasActiveTournament = tData.stage !== 'setup';
+
+    return (
+      <div className="animate-fade-in max-w-7xl mx-auto space-y-8 text-left">
+        {onBack && (
+          <button 
+            onClick={onBack} 
+            className="mb-2 px-5 py-2.5 bg-slate-900/80 backdrop-blur-md rounded-full text-white font-bold transition shadow-lg hover:bg-slate-850 flex items-center w-fit active:scale-95 border border-white/10"
+          >
+            <span className="mr-2">⬅</span> Voltar ao Menu
+          </button>
+        )}
+
+        {/* Portal Welcome Header Banner */}
+        <div className="relative overflow-hidden rounded-2xl bg-gradient-to-r from-blue-950 via-indigo-950 to-slate-900 text-white p-6 md:p-8 border border-white/10 shadow-2xl">
+          <div className="absolute top-0 right-0 p-10 opacity-10 font-black text-9xl select-none pointer-events-none">
+            🏆
+          </div>
+          <div className="relative z-10 space-y-2 text-left">
+            <h1 className="text-2xl md:text-5xl font-black uppercase tracking-tight">
+              Central de Torneios
+            </h1>
+            <p className="text-xs md:text-sm text-slate-300 font-medium max-w-2xl leading-relaxed">
+              Crie novas competições personalizadas ou acesse o histórico completo de campeonatos salvos na nuvem. Todos os confrontos e resultados são atualizados em tempo real!
+            </p>
+          </div>
+        </div>
+
+        {/* Quick Shortcut for Running Tournament */}
+        {hasActiveTournament && (
+          <div className="bg-amber-600/10 border border-amber-500/30 rounded-xl p-4 md:p-5 flex flex-col md:flex-row items-center justify-between gap-4 text-left animate-pulse">
+            <div className="flex items-center gap-3">
+              <span className="text-3xl">📢</span>
+              <div>
+                <span className="text-[10px] uppercase font-bold text-amber-500 tracking-wider">HÁ UM TORNEIO INSTALADO NA QUADRA EM ANDAMENTO!</span>
+                <h3 className="text-base font-black text-white">{tData.name || 'Torneio Ativo'}</h3>
+                <p className="text-xs text-slate-400">Modalidade: <span className="font-bold text-slate-300 capitalize">{tData.modality?.replace('_', ' ')}</span> • Fase: <span className="font-bold text-slate-300 capitalize">{tData.stage}</span></p>
+              </div>
+            </div>
+            <button
+              onClick={() => setCurrentView('tournament')}
+              className="bg-amber-500 hover:bg-amber-600 active:scale-95 text-slate-950 px-6 py-2.5 rounded-xl font-bold text-xs transition shadow-lg shrink-0"
+            >
+              Entrar no Torneio Ativo Atual ➡️
+            </button>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+          {/* LEFT: New Tournament Setup Wizard */}
+          <div className="lg:col-span-5 bg-white border border-slate-200 shadow-xl rounded-2xl p-6 md:p-8 flex flex-col justify-between text-left min-h-[500px]">
+            <div>
+              <div className="flex justify-between items-center border-b border-slate-100 pb-3 mb-6">
+                <h2 className="text-lg font-black text-slate-800 uppercase tracking-tight flex items-center gap-2">
+                  <span className="text-blue-500">🆕</span> Novo Torneio de Raiz
+                </h2>
+                <span className="text-[10px] bg-blue-100 px-2 py-0.5 rounded text-blue-800 font-bold">WIZARD</span>
+              </div>
+
+              {/* Quick school preset button */}
+              <div className="mb-4 p-3.5 bg-gradient-to-br from-blue-50 to-indigo-50 border border-blue-100 rounded-xl">
+                <span className="text-[10px] font-black uppercase text-blue-600 tracking-wider block mb-1">💡 PRESET RECOMENDADO</span>
+                <span className="block text-[11px] font-semibold text-slate-800 leading-tight mb-2">Configure o Torneio Interclasses da sua escola de forma automatizada com 1 clique.</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTournamentName("Copa Interclasses Cordélia");
+                    setModality("xadrez_dama");
+                    setParticipantType("individual");
+                    setPlayerCount(24);
+                    setSelectedFormat("grupos_mata_mata");
+                    setSelectedNumGroups(6);
+                    setNumAdvancers(2);
+                    setFinalsStyle("copa_do_mundo");
+                    setIsInterclassesSorteio(true);
+                    
+                    // Directly move to Step 3 with preset
+                    const classesPreset = ["Turma A", "Turma B", "Turma C", "Turma D", "Turma E", "Turma F"];
+                    const list = SUGGESTED_NAMES.xadrez_dama || GENERIC_NAMES;
+                    const shuffledList = [...list];
+                    for (let x = shuffledList.length - 1; x > 0; x--) {
+                      const y = Math.floor(Math.random() * (x + 1));
+                      [shuffledList[x], shuffledList[y]] = [shuffledList[y], shuffledList[x]];
+                    }
+
+                    setPlayerInputs(Array.from({ length: 24 }, (_, i) => {
+                      const name = i < shuffledList.length ? shuffledList[i] : `Aluno ${i + 1}`;
+                      return {
+                        name,
+                        class: classesPreset[Math.floor(i / 4)]
+                      };
+                    }));
+                    setTData(prev => ({ ...prev, stage: 'setup' }));
+                    setSetupStep(3); // Names sheet
+                    setCurrentView('tournament');
+                  }}
+                  className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-black text-xs rounded-lg transition shadow flex items-center justify-center gap-1.5 active:scale-95 text-center leading-none"
+                >
+                  🏫 Ativar Copa Escola (24 alunos × 6 turmas, sem repetição)
+                </button>
+              </div>
+
+              {/* Set Name */}
+              <div className="space-y-4">
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-black uppercase text-slate-500 tracking-wider">Nome da Competição</label>
+                  <input
+                    type="text"
+                    className="w-full px-4 py-2.5 bg-slate-50 border border-slate-300 rounded-xl font-bold text-slate-800 focus:ring-2 focus:ring-blue-500 outline-none text-xs shadow-inner transition placeholder:text-slate-400"
+                    placeholder="Ex: Torneio do Cordélia Paiva"
+                    value={tournamentName}
+                    onFocus={(e) => e.target.select()}
+                    onChange={(e) => setTournamentName(e.target.value)}
+                  />
+                </div>
+
+                {/* Modality Selector */}
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-black uppercase text-slate-500 tracking-wider">Modalidade Esportiva</label>
+                  <select
+                    value={modality}
+                    onChange={(e) => {
+                      const mKey = e.target.value as any;
+                      setModality(mKey);
+                      if (['futebol_futsal', 'basquete', 'handebol', 'volei'].includes(mKey)) {
+                        setParticipantType('team');
+                      } else {
+                        setParticipantType('individual');
+                      }
+                    }}
+                    className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-xl font-bold text-slate-800 focus:outline-none"
+                  >
+                    <option value="xadrez_dama">♟️ Xadrez / Dama</option>
+                    <option value="futebol_futsal">⚽ Futebol / Futsal</option>
+                    <option value="basquete">🏀 Basquete</option>
+                    <option value="handebol">🤾 Handebol</option>
+                    <option value="volei">🏐 Vôlei</option>
+                    <option value="queimado">☄️ Queimado</option>
+                    <option value="tenis_mesa">🏓 Tênis de Mesa</option>
+                    <option value="outro">🥇 Outro Esporte</option>
+                  </select>
+                </div>
+
+                {/* Participant type */}
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-black uppercase text-slate-500 tracking-wider">Tipo de Competidor</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setParticipantType('individual')}
+                      className={`py-2 px-3 rounded-xl border text-xs font-bold transition flex items-center justify-center gap-2 ${participantType === 'individual' ? 'bg-blue-50 border-blue-500 text-blue-700' : 'bg-slate-50 border-slate-200 text-slate-600'}`}
+                    >
+                      👤 Individual
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setParticipantType('team')}
+                      className={`py-2 px-3 rounded-xl border text-xs font-bold transition flex items-center justify-center gap-2 ${participantType === 'team' ? 'bg-blue-50 border-blue-500 text-blue-700' : 'bg-slate-50 border-slate-200 text-slate-600'}`}
+                    >
+                      👥 Equipe
+                    </button>
+                  </div>
+                </div>
+
+                {/* Player count input */}
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-black uppercase text-slate-500 tracking-wider">Quantidade de {participantType === 'team' ? 'Equipes' : 'Alunos'}</label>
+                  <input
+                    type="number"
+                    min="3"
+                    max="100"
+                    className="w-full px-4 py-2 bg-slate-50 border border-slate-300 rounded-xl font-bold text-slate-800 text-xs focus:ring-1 focus:ring-blue-500 outline-none"
+                    value={playerCount || ''}
+                    onFocus={(e) => e.target.select()}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val === '') {
+                        setPlayerCount('' as any);
+                      } else {
+                        const parsed = parseInt(val, 10);
+                        setPlayerCount(isNaN(parsed) ? '' as any : parsed);
+                      }
+                    }}
+                    onBlur={() => {
+                      if (!playerCount || isNaN(playerCount) || playerCount < 3) {
+                        setPlayerCount(3);
+                      } else if (playerCount > 100) {
+                        setPlayerCount(100);
+                      }
+                    }}
+                  />
+                </div>
+
+                {/* Format choice */}
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-black uppercase text-slate-500 tracking-wider">Formato Geral da Competição</label>
+                  <select
+                    value={selectedFormat}
+                    onChange={(e) => setSelectedFormat(e.target.value as any)}
+                    className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-xl font-bold text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  >
+                    <option value="grupos_mata_mata">🌍 Grupos + Finais Playoffs</option>
+                    <option value="mata_mata">⚔️ Mata-Mata Direto (Copa do Brasil style)</option>
+                    <option value="grupo_unico">📊 Campeonato Puro (Pontos Corridos)</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <button
+              onClick={() => {
+                setPlayerInputs(Array.from({ length: playerCount }, () => ({ name: '', class: '' })));
+                setTData(prev => ({ ...prev, stage: 'setup' }));
+                setSetupStep(3); // Start names view (Names Form Step)
+                setCurrentView('tournament');
+              }}
+              className="w-full mt-6 py-3.5 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white font-black text-sm rounded-xl transition shadow-lg text-center"
+            >
+              Configurar Nomes dos Competidores ➜
+            </button>
+          </div>
+
+          {/* RIGHT: Saved Tournaments Cloud History */}
+          <div className="lg:col-span-12 xl:col-span-7 bg-slate-900 border border-white/10 rounded-2xl p-6 md:p-8 text-left min-h-[500px] flex flex-col justify-between">
+            <div className="space-y-4">
+              <div className="flex justify-between items-center border-b border-white/5 pb-3 mb-4">
+                <h2 className="text-lg font-black text-white uppercase tracking-tight flex items-center gap-2">
+                  <span className="text-yellow-400">📜</span> Torneios na Nuvem
+                </h2>
+                <span className="text-[10px] bg-yellow-500/20 border border-yellow-500/35 px-2 py-0.5 rounded text-yellow-300 font-bold uppercase tracking-wider">Histórico</span>
+              </div>
+
+              {savedTournaments.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-16 text-center text-slate-400 space-y-3">
+                  <span className="text-5xl">☁️</span>
+                  <p className="font-bold text-sm text-slate-300">Nenhum torneio salvo no histórico.</p>
+                  <p className="text-[11px] max-w-sm text-slate-500 leading-relaxed">As competições que você inicia são salvas de forma automática e permanente na nuvem para que qualquer organizador ou aluno possa acompanhar!</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 gap-4 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar">
+                  {savedTournaments.map((t) => {
+                    const dateStr = t.createdAt ? new Date(t.createdAt).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' }) : 'Sem Data';
+                    const modalityEmojiMap: Record<string, string> = {
+                      xadrez_dama: '♟️',
+                      futebol_futsal: '⚽',
+                      basquete: '🏀',
+                      handebol: '🤾',
+                      volei: '🏐',
+                      queimado: '☄️',
+                      tenis_mesa: '🏓',
+                      outro: '🥇'
+                    };
+                    const emoji = modalityEmojiMap[t.modality || 'outro'] || '🥇';
+
+                    let stageBadge = "Setup";
+                    let badgeClass = "bg-slate-700 text-slate-200 border-slate-600";
+                    if (t.stage === 'groups') {
+                      stageBadge = "Grupos";
+                      badgeClass = "bg-blue-600/20 text-blue-300 border-blue-500/30 font-bold";
+                    } else if (t.stage === 'finals') {
+                      stageBadge = "Finais/Playoffs";
+                      badgeClass = "bg-orange-600/20 text-orange-300 border-orange-500/30 font-bold";
+                    } else if (t.stage === 'finished') {
+                      stageBadge = "Concluído";
+                      badgeClass = "bg-green-600/20 text-green-300 border-green-500/30 font-extrabold";
+                    }
+
+                    return (
+                      <div key={t.id} className="relative bg-slate-850 border border-white/5 rounded-xl p-4 hover:border-blue-500/55 transition duration-200 shadow-lg group hover:bg-slate-800">
+                        <div className="flex justify-between items-start mb-2 gap-2">
+                          <div>
+                            <h3 className="font-bold text-sm text-white group-hover:text-blue-300 transition tracking-tight">{t.name || 'Torneio sem Nome'}</h3>
+                            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 mt-1 text-[10px] text-slate-400">
+                              <span className="font-semibold text-slate-200">{emoji} {t.modality?.replace('_', ' ').toUpperCase()}</span>
+                              <span className="text-slate-600">•</span>
+                              <span className="font-mono">{t.players?.length || 0} {t.participantType === 'team' ? 'Equipes' : 'Jogadores'}</span>
+                              <span className="text-slate-600">•</span>
+                              <span className="font-mono">{dateStr}</span>
+                            </div>
+                          </div>
+                          <span className={`text-[9px] px-2 py-0.5 rounded-full border ${badgeClass} shrink-0`}>
+                            {stageBadge}
+                          </span>
+                        </div>
+
+                        {/* Summary Block */}
+                        <div className="my-2.5 p-2 bg-black/35 rounded-lg border border-white/5 text-[11px] text-slate-300 leading-relaxed font-mono">
+                          <span className="text-[9px] block uppercase font-bold text-slate-500 tracking-wider mb-0.5">Resumo da AI</span>
+                          {t.summary || getTournamentSummary(t)}
+                        </div>
+
+                        {/* Action buttons */}
+                        <div className="flex flex-wrap justify-between items-center gap-2 mt-3.5 border-t border-white/5 pt-3">
+                          <button
+                            onClick={() => handleLoadTournament(t)}
+                            className="bg-blue-600 hover:bg-blue-700 active:scale-95 text-white font-bold text-[10px] md:text-xs rounded-lg px-3 py-1.5 transition flex items-center gap-1 shrink-0 font-sans"
+                          >
+                            <span>Entrar</span> ➜
+                          </button>
+
+                          <div className="flex items-center gap-1">
+                            <button
+                              onClick={() => handleUseFormat(t)}
+                              title="Criar nova competição repetindo este mesmo formato e definições"
+                              className="bg-slate-800 hover:bg-slate-750 active:scale-95 border border-white/5 text-slate-300 hover:text-white font-semibold text-[10px] md:text-xs rounded-lg px-2.5 py-1.5 transition flex items-center gap-1 shrink-0 font-sans"
+                            >
+                              <span>Usar Formato 🔄</span>
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (confirm(`Deletar permanentemente o torneio "${t.name}" da nuvem? Esta ação é irreversível.`)) {
+                                  deleteSavedTournament(t.id!);
+                                }
+                              }}
+                              className="bg-red-950/40 hover:bg-red-900/40 border border-red-500/25 walk-all text-red-400 font-bold text-[10px] md:text-xs rounded-lg p-2.5 transition active:scale-95 shrink-0"
+                              title="Excluir Histórico"
+                            >
+                              🗑️
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+            
+            <p className="text-[9px] text-slate-400 text-center mt-6 uppercase tracking-wider font-semibold">
+              ☁️ Firestore Sincronizado • Nuvem Compartilhada do Colégio
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   // --- VIEW: SETUP WIZARD ---
+
+  if (isGeneratingSummary) {
+    return (
+      <div className="fixed inset-0 z-[110] bg-slate-950/85 backdrop-blur-md flex flex-col items-center justify-center text-center px-4">
+        <div className="space-y-6 max-w-sm animate-pulse text-white">
+          <div className="text-6xl animate-bounce">⚡</div>
+          <h2 className="text-xl font-black uppercase tracking-wider text-amber-400">Gerando Torneio</h2>
+          <p className="text-xs text-slate-400 font-mono">Conectando ao assistente na nuvem para analisar o chaveamento, gerar as tabelas e computar o resumo inteligente AI...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (currentView === 'portal') {
+    return renderPortalView();
+  }
 
   if (tData.stage === 'setup') {
     return (
@@ -1484,6 +2240,7 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
                           >
                             <option value={2}>2 Grupos</option>
                             <option value={4}>4 Grupos</option>
+                            <option value={6}>6 Grupos</option>
                             {playerCount >= 8 && <option value={8}>8 Grupos</option>}
                           </select>
                         </div>
@@ -1511,6 +2268,34 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
                             <option value="tradicional">Circular Tradicional (Tabela 📊)</option>
                           </select>
                         </div>
+                      </div>
+
+                      <div className="pt-3 border-t border-slate-200 mt-2">
+                        <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={isInterclassesSorteio}
+                            onChange={(e) => {
+                              const checked = e.target.checked;
+                              setIsInterclassesSorteio(checked);
+                              if (checked) {
+                                setPlayerCount(24);
+                                setSelectedNumGroups(6);
+                                setNumAdvancers(2);
+                                setFinalsStyle('copa_do_mundo');
+                              }
+                            }}
+                            className="mt-0.5 w-4 h-4 text-blue-600 border-slate-300 rounded focus:ring-blue-500"
+                          />
+                          <div>
+                            <span className="text-xs font-bold text-slate-850 flex items-center gap-1.5">
+                              ✨ Sorteio Inteligente Interclasses (Copa Escola - 24 Alunos × 6 Grupos)
+                            </span>
+                            <span className="block text-[10px] text-slate-500 font-medium leading-relaxed">
+                              Alunos são distribuídos nos 6 grupos de forma randômica garantindo que **cada grupo tenha representantes de turmas diferentes** (sem jamais repetir representantes da mesma turma no mesmo grupo). Em seguida, joga-se no mesmo modelo de regras que aconteciam nas Copas do Mundo de 24 seleções (passam os 1º e 2º colocados, além dos 4 melhores 3º colocados no geral para formar as Oitavas de Final!).
+                            </span>
+                          </div>
+                        </label>
                       </div>
                     </div>
                   )}
@@ -1611,6 +2396,12 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
             <h2 className="text-xl font-black uppercase shadow-black drop-shadow-md">Fase de Grupos</h2>
           </div>
           <div className="flex items-center gap-2">
+            <button
+              onClick={() => setCurrentView('portal')}
+              className="bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-3 py-2 text-xs font-bold transition flex items-center gap-1.5 active:scale-95 shadow-md font-sans"
+            >
+              <span>🏰</span> Central de Torneios
+            </button>
             <button
               onClick={() => setShowRulesModal(true)}
               className="bg-white/10 hover:bg-white/20 text-white rounded-lg px-3 py-2 text-xs font-bold transition flex items-center gap-1.5 border border-white/10 active:scale-95 shadow-sm"
@@ -1717,6 +2508,12 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
           </div>
           <div className="flex items-center gap-2">
             <button
+              onClick={() => setCurrentView('portal')}
+              className="bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-3 py-1.5 text-xs font-bold transition flex items-center gap-1.5 active:scale-95 shadow-md font-sans"
+            >
+              <span>🏰</span> Central de Torneios
+            </button>
+            <button
               onClick={() => setShowRulesModal(true)}
               className="bg-white/10 hover:bg-white/20 text-white rounded-lg px-3 py-1.5 text-xs font-bold transition flex items-center gap-1.5 border border-white/10 active:scale-95 shadow-sm"
             >
@@ -1724,9 +2521,9 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
             </button>
             <button 
               onClick={() => { if(confirm('Cancelar todo o torneio?')) { setTData({...tData, stage:'setup'}); setSetupStep(0); } }} 
-              className="text-white/60 hover:text-white underline text-xs"
+              className="bg-red-950/40 hover:bg-red-900/40 text-red-300 border border-red-500/30 rounded-lg px-3 py-1.5 text-xs font-bold transition duration-155 active:scale-95"
             >
-              Sair
+              Excluir
             </button>
           </div>
         </div>
@@ -1889,27 +2686,40 @@ export const TournamentsView: React.FC<{ onBack?: () => void }> = ({ onBack }) =
             })}
           </div>
 
-          <button 
-            type="button"
-            onClick={() => { 
-              exitFullScreen();
-              setTData({
-                stage: 'setup',
-                players: [],
-                groups: [],
-                matches: [],
-                finalMatches: [],
-                finalPlayers: [],
-                modality: 'xadrez_dama',
-                participantType: 'individual',
-                format: 'grupos_mata_mata'
-              }); 
-              setSetupStep(0); 
-            }}
-            className="px-8 py-3.5 bg-white text-slate-950 font-black text-base rounded-full hover:bg-slate-100 transition transform hover:scale-105 shadow-2xl active:scale-95 text-center"
-          >
-            Configurar Outro Torneio 🔄
-          </button>
+          <div className="flex flex-col sm:flex-row gap-3 items-center justify-center">
+            <button 
+              type="button"
+              onClick={() => { 
+                exitFullScreen();
+                setCurrentView('portal');
+              }}
+              className="px-8 py-3.5 bg-blue-600 hover:bg-blue-750 text-white font-black text-xs md:text-sm rounded-full transition transform hover:scale-105 shadow-2xl active:scale-95 text-center"
+            >
+              🏰 Central de Torneios
+            </button>
+            <button 
+              type="button"
+              onClick={() => { 
+                exitFullScreen();
+                setTData({
+                  stage: 'setup',
+                  players: [],
+                  groups: [],
+                  matches: [],
+                  finalMatches: [],
+                  finalPlayers: [],
+                  modality: 'xadrez_dama',
+                  participantType: 'individual',
+                  format: 'grupos_mata_mata'
+                }); 
+                setSetupStep(0); 
+                setCurrentView('portal');
+              }}
+              className="px-8 py-3.5 bg-white text-slate-950 font-black text-xs md:text-sm rounded-full hover:bg-slate-100 transition transform hover:scale-105 shadow-2xl active:scale-95 text-center"
+            >
+              Configurar Outro Torneio 🔄
+            </button>
+          </div>
         </div>
       </div>
     );

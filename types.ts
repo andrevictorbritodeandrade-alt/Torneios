@@ -154,6 +154,10 @@ export interface KnockoutRound {
 }
 
 export interface TournamentState {
+  id?: string;
+  name?: string;
+  createdAt?: number;
+  summary?: string;
   stage: 'setup' | 'groups' | 'finals' | 'finished';
   players: Player[];
   groups: Group[];
@@ -161,6 +165,7 @@ export interface TournamentState {
   finalMatches: Match[];
   finalPlayers: string[];
   rules?: string[];
+  isInterclassesSorteio?: boolean;
   // Extended tournament options
   modality?: 'xadrez_dama' | 'futebol_futsal' | 'basquete' | 'handebol' | 'volei' | 'queimado' | 'tenis_mesa' | 'outro';
   participantType?: 'individual' | 'team';
