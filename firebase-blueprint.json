@@ -1,0 +1,34 @@
+{
+  "entities": {
+    "GalleryImage": {
+      "title": "Gallery Image",
+      "description": "An image in the application gallery",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "url": { "type": "string", "description": "URL or base64 data of the image" },
+        "description": { "type": "string" },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["id", "title", "url", "createdAt"]
+    },
+    "GalleryData": {
+      "title": "Gallery Data",
+      "description": "Collection of gallery images",
+      "type": "object",
+      "properties": {
+        "images": {
+          "type": "array",
+          "items": { "$ref": "GalleryImage" }
+        }
+      }
+    }
+  },
+  "firestore": {
+    "/gallery/main": {
+      "schema": "GalleryData",
+      "description": "Main gallery storage"
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "name": "clube-do-xadrez",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^19.2.4",
+    "jspdf": "^4.1.0",
+    "recharts": "^3.7.0",
+    "react-dom": "^19.2.4",
+    "chess.js": "^1.4.0",
+    "firebase": "^12.9.0",
+    "react-chessboard": "^4.7.2",
+    "html2canvas": "^1.4.1",
+    "@google/genai": "^1.41.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  }
+}

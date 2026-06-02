@@ -1,0 +1,23 @@
+{
+  "name": "CLUBE DO XADREZ",
+  "short_name": "CLUBE DO XADREZ",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#2563eb",
+  "description": "Sistema de gestão de clube de xadrez escolar com chamadas, torneios e atividades.",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3001/3001787.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3001/3001787.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "orientation": "portrait",
+  "scope": "/"
+}

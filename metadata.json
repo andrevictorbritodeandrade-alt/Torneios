@@ -1,0 +1,10 @@
+{
+  "name": "TORNEIOS",
+  "description": "Sistema de Gestão de Torneios de Xadrez.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
